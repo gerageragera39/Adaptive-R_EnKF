@@ -13,7 +13,14 @@ from .enkf import EnKFResult, collect_training_features, run_enkf
 from .metrics import summarize_assimilation
 from .observations import ObservationData, generate_observations
 from .lorenz96 import simulate_trajectory
-from .plotting import plot_grid_bar, plot_r_tracking, plot_rmse_comparison, plot_state_heatmap
+from .plotting import (
+    plot_adaptive_improvement_aggregated,
+    plot_grid_bar,
+    plot_grid_bar_aggregated,
+    plot_r_tracking,
+    plot_rmse_comparison,
+    plot_state_heatmap,
+)
 
 
 @dataclass
@@ -182,3 +189,105 @@ def run_grid_experiment(
         summary.to_csv("results/experiment_summary.csv", index=False)
         plot_grid_bar(summary, "figures/grid_mean_analysis_rmse.png")
     return summary
+
+
+
+AGGREGATION_METRICS = [
+    "mean_analysis_rmse",
+    "mean_forecast_rmse",
+    "median_analysis_rmse",
+    "r_mae",
+    "r_corr",
+    "analysis_improvement",
+]
+
+
+def aggregate_seed_results(raw_summary: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate raw grid rows across seeds.
+
+    Rows are grouped by ``N``, ``dt_obs``, and ``method``. Standard deviations
+    use population std (ddof=0), so one-seed runs report 0 rather than NaN.
+    """
+    if raw_summary.empty:
+        raise ValueError("raw_summary dataframe is empty")
+    required = {"N", "dt_obs", "method", "seed", *AGGREGATION_METRICS}
+    missing = required - set(raw_summary.columns)
+    if missing:
+        raise ValueError(f"raw_summary missing required columns: {sorted(missing)}")
+
+    rows: List[dict] = []
+    for (N, dt_obs, method), group in raw_summary.groupby(["N", "dt_obs", "method"], sort=True):
+        row = {
+            "N": int(N),
+            "dt_obs": float(dt_obs),
+            "method": method,
+            "n_seeds": int(group["seed"].nunique()),
+        }
+        for metric in AGGREGATION_METRICS:
+            values = pd.to_numeric(group[metric], errors="coerce")
+            row[f"{metric}_mean"] = float(values.mean())
+            row[f"{metric}_std"] = float(values.std(ddof=0))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def run_multi_seed_grid_experiment(
+    seeds: Sequence[int],
+    ensemble_sizes: Sequence[int] = (10, 20, 40),
+    dt_obs_values: Sequence[float] = (0.05, 0.1, 0.2),
+    T: float = 10.0,
+    r_mode: str = "sinusoidal",
+    ml_model_type: str = "random_forest",
+    save_outputs: bool = True,
+    results_dir: str | Path = "results",
+    figures_dir: str | Path = "figures",
+    n_train_runs: int = 4,
+    T_train: float = 10.0,
+    spinup_time: float = 5.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run the full N × dt_obs grid for each seed and aggregate over seeds.
+
+    Returns
+    -------
+    raw_summary, aggregated_summary
+        ``raw_summary`` has one row per seed/N/dt_obs/method. ``aggregated`` has
+        one row per N/dt_obs/method with mean/std metrics and ``n_seeds``.
+    """
+    seeds = [int(seed) for seed in seeds]
+    if not seeds:
+        raise ValueError("At least one seed is required")
+
+    rows: List[dict] = []
+    for seed in seeds:
+        for N in ensemble_sizes:
+            for dt_obs in dt_obs_values:
+                cfg = ExperimentConfig(
+                    N=int(N),
+                    dt_obs=float(dt_obs),
+                    T=float(T),
+                    seed=seed,
+                    r_mode=r_mode,
+                    ml_model_type=ml_model_type,
+                    n_train_runs=int(n_train_runs),
+                    T_train=float(T_train),
+                    spinup_time=float(spinup_time),
+                )
+                out = run_single_experiment(cfg, save_outputs=False)
+                rows.extend(out["summary"].to_dict(orient="records"))
+
+    raw_summary = pd.DataFrame(rows)
+    aggregated = aggregate_seed_results(raw_summary)
+
+    if save_outputs:
+        results_path = Path(results_dir)
+        figures_path = Path(figures_dir)
+        results_path.mkdir(parents=True, exist_ok=True)
+        figures_path.mkdir(parents=True, exist_ok=True)
+        raw_summary.to_csv(results_path / "experiment_summary_raw.csv", index=False)
+        aggregated.to_csv(results_path / "experiment_summary_aggregated.csv", index=False)
+        # Keep a conventional latest grid CSV for backwards-compatible loading.
+        raw_summary.to_csv(results_path / "experiment_summary.csv", index=False)
+        plot_grid_bar_aggregated(aggregated, figures_path / "grid_mean_analysis_rmse_aggregated.png")
+        plot_adaptive_improvement_aggregated(aggregated, figures_path / "grid_adaptive_improvement_aggregated.png")
+
+    return raw_summary, aggregated
